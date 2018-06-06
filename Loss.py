@@ -7,21 +7,17 @@ from __future__ import division
 import time
 import sys
 import math
-
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 
 
-def nmt_criterion(vocab_size, gpuid, pad_id=0):
+def nmt_criterion(vocab_size, pad_id=0):
     """
     Construct the standard NMT Criterion
     """
     weight = torch.ones(vocab_size)
     weight[pad_id] = 0
     crit = nn.NLLLoss(weight, size_average=False)
-    if gpuid:
-        crit.cuda()
     return crit
 
 
@@ -44,6 +40,7 @@ class Statistics:
         return 100 * (self.n_correct / self.n_words)
 
     def ppl(self):
+        print(self.loss, self.n_words)
         return math.exp(min(self.loss / self.n_words, 100))
 
     def elapsed_time(self):
@@ -73,61 +70,45 @@ class Statistics:
         non_padding = targ.ne(pad)
         num_correct = pred.eq(targ) \
                           .masked_select(non_padding).int() \
-                          .sum()
-        return Statistics(loss[0], non_padding.int().sum(), num_correct)
+                          .sum().item()
+        return Statistics(loss, non_padding.int().sum().item(), num_correct)
 
 
 def filter_gen_state(state):
     for k, v in state.items():
         if v is not None:
-            if isinstance(v, Variable) and v.requires_grad:
-                v = Variable(v.data, requires_grad=True, volatile=False)
             yield k, v
 
 
+def new_split(x, size):
+    xs = []
+    for u in torch.split(x, size):
+        v = u.detach()
+        if u.requires_grad:
+            v.requires_grad_(True)
+        xs += [v]
+    return tuple(xs)
+
+
 def shards(state, shard_size, eval=False):
-    """
-    state:
-        A dictionary which corresponds to the output of
-        LossCompute.make_loss_batch(). In other words, its keys are
-        {'out', 'target', 'align', 'coverage', 'attn'}. The values
-        for those keys are Tensor-like or None.
-    shard_size:
-        The maximum size of the shards yielded by the model
-    eval:
-        If True, only yield the state, nothing else. Otherwise, yield shards.
-    yields:
-        Each yielded shard is a dict.
-    side effect:
-        After the last shard, this function does back-propagation.
-    """
     if eval:
         yield state
     else:
-        # non_none: the subdict of the state dictionary where the values
-        # are not None.
         non_none = dict(filter_gen_state(state))
 
-        # Now, the iteration:
-        # split_state is a dictionary of sequences of tensor-like but we
-        # want a sequence of dictionaries of tensors.
-        # First, unzip the dictionary into a sequence of keys and a
-        # sequence of tensor-like sequences.
-        keys, values = zip(*((k, torch.split(v, shard_size))
+        keys, values = zip(*((k, new_split(v, shard_size))
                              for k, v in non_none.items()))
-
-        # Now, yield a dictionary for each shard. The keys are always
-        # the same. values is a sequence of length #keys where each
-        # element is a sequence of length #shards. We want to iterate
-        # over the shards, not over the keys: therefore, the values need
-        # to be re-zipped by shard and then each shard can be paired
-        # with the keys.
         for shard_tensors in zip(*values):
             yield dict(zip(keys, shard_tensors))
 
         # Assumed backprop'd
-        variables = ((state[k], v.grad.data) for k, v in non_none.items()
-                     if isinstance(v, Variable) and v.grad is not None)
+        variables = []
+        for i, k in enumerate(keys):
+            dv = [v.grad for v in values[i] if v.grad is not None]
+            if dv:
+                dv = torch.cat(dv)
+                variables += [(state[k], dv)]
+
         inputs, grads = zip(*variables)
         torch.autograd.backward(inputs, grads)
 
@@ -146,6 +127,7 @@ class LossCompute:
                 "target": targets}
 
     def compute_loss(self, out, target):
+
         def bottle(v):
             return v.view(-1, v.size(2))
 
@@ -154,11 +136,9 @@ class LossCompute:
         # Standard generator.
         scores = self.generator(bottle(out))
         loss = self.crit(scores, target)
-        scores_data = scores.data.clone()
-        target = target.data.clone()
+        scores_data = scores.detach()
+        target = target.clone()
 
         # Coverage loss term.
-        ppl = loss.data.clone()
-
-        stats = Statistics.score(ppl, scores_data, target, 0)
+        stats = Statistics.score(loss.item(), scores_data, target, 0)
         return loss, stats

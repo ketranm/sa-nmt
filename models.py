@@ -77,9 +77,10 @@ class MatrixTree(nn.Module):
     of non-projective dependency parsing. This attention layer is used
     in the paper "Learning Structured Text Representations."
     """
-    def __init__(self, eps=1e-5):
+    def __init__(self, eps=1e-5, device=torch.device('cpu')):
         self.eps = eps
         super(MatrixTree, self).__init__()
+        self.device = device
 
     def forward(self, input, lengths=None):
         laplacian = input.exp()
@@ -89,7 +90,7 @@ class MatrixTree(nn.Module):
             lx = lengths[b] if lengths is not None else input.size(1)
             input_b = input[b, :lx, :lx]
             lap = laplacian[b, :lx, :lx].masked_fill(
-                Variable(torch.eye(lx).cuda().ne(0)), 0)
+                torch.eye(lx).to(self.device).ne(0), 0)
             lap = -lap + torch.diag(lap.sum(0))
             # store roots on diagonal
             lap[0] = input_b.diag().exp()
@@ -110,7 +111,8 @@ class MatrixTree(nn.Module):
 
 class TreeAttention(nn.Module):
     """Structured attention class"""
-    def __init__(self, dim, min_thres=-5, max_thres=7, hard=False):
+    def __init__(self, dim, min_thres=-5, max_thres=7, hard=False,
+                 device=torch.device('cpu')):
         super(TreeAttention, self).__init__()
         self.q = nn.Linear(dim, dim, bias=False)
         self.k = nn.Linear(dim, dim, bias=False)
@@ -121,6 +123,7 @@ class TreeAttention(nn.Module):
         self.min_thres = min_thres
         self.max_thres = max_thres
         self.hard = hard
+        self.device = device
 
     def forward(self, input, punct_mask=None, lengths=None):
         s_len, batch, dim = input.size()
@@ -134,7 +137,7 @@ class TreeAttention(nn.Module):
         # compute root
         r_ = self.root_query.view(1, -1, 1).expand(batch, dim, 1)
         root = torch.bmm(k, r_).squeeze(-1)  # (batch, s_len)
-        mask = Variable(torch.eye(s_len).cuda(), requires_grad=False)
+        mask = torch.eye(s_len).to(self.device)
         score = _score.clone()
         for b in range(batch):
             score[b] = _score[b] * mask + torch.diag(root[b])
@@ -380,7 +383,7 @@ def make_decoder(opt):
                    opt.encode_multi_key, opt.share_attn)
 
 
-def make_base_model(model_opt, gpu, checkpoint=None):
+def make_base_model(model_opt, checkpoint=None):
     """
     Args:
         model_opt: the option loaded from checkpoint.
@@ -405,11 +408,6 @@ def make_base_model(model_opt, gpu, checkpoint=None):
         generator[0].weight = decoder.embeddings.weight
 
     model.generator = generator
-    # Make the whole model leverage GPU if indicated to do so.
-    if gpu:
-        model.cuda()
-    else:
-        model.cpu()
     # Load the model states from checkpoint.
     if checkpoint is not None:
         print('Loading model')

@@ -1,8 +1,7 @@
 import argparse
 import torch
-from torch.autograd import Variable
 from Iterator import TextIterator
-import modelx as models
+import models
 from itertools import zip_longest
 import random
 import Loss
@@ -13,7 +12,6 @@ import subprocess
 from infer import Beam
 import re
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from adam import MyAdam
 
 parser = argparse.ArgumentParser(description='train.py')
 
@@ -37,30 +35,25 @@ opts.train_opts(parser)
 opts.preprocess_opts(parser)
 
 opt = parser.parse_args()
-
-use_gpu = (len(opt.gpuid) > 0)
-
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # for reproducibility
 torch.manual_seed(opt.seed)
 random.seed(opt.seed)
-if use_gpu:
+if torch.cuda.is_available():
     torch.cuda.manual_seed(opt.seed)
+
 print(opt)
 
 
 # batch preparation
-def prepare_data(seqs_x, seqs_y, eval=False):
-    tt = torch.cuda if use_gpu else torch
+def prepare_data(seqs_x, seqs_y):
     mb = [(seqs_x[i], seqs_y[i]) for i in range(len(seqs_x))]
     mb.sort(key=lambda x: len(x[0]), reverse=True)
-    xs = tt.LongTensor(
-        list(zip_longest(*map(lambda x: x[0], mb), fillvalue=0)))
-    ys = tt.LongTensor(
-        list(zip_longest(*map(lambda x: x[1], mb), fillvalue=0)))
+    xs = torch.LongTensor(
+        list(zip_longest(*map(lambda x: x[0], mb), fillvalue=0))).to(device)
+    ys = torch.LongTensor(
+        list(zip_longest(*map(lambda x: x[1], mb), fillvalue=0))).to(device)
     lengths_x = [len(x[0]) for x in mb]
-    xs = Variable(xs, volatile=eval)
-    ys = Variable(ys, volatile=eval)
-
     return xs, ys, lengths_x
 
 
@@ -128,14 +121,15 @@ def train(opt):
           (opt.src_vocab_size, opt.tgt_vocab_size))
     dicts = [train.source_dict, train.target_dict]
 
-    crit = Loss.nmt_criterion(opt.tgt_vocab_size, use_gpu, 0)
+    crit = Loss.nmt_criterion(opt.tgt_vocab_size, 0).to(device)
     if opt.train_from != '':
         print('| Load trained model!')
         checkpoint = torch.load(opt.train_from)
-        model = models.make_base_model(opt, use_gpu, checkpoint)
+        model = models.make_base_model(opt, checkpoint)
     else:
-        model = models.make_base_model(opt, use_gpu)
+        model = models.make_base_model(opt)
         init_uniform(model)
+    model.to(device)
     if opt.encoder_type in ["sabrnn", "fabrnn"]:
         print('Add punctuation constrain!')
         model.encoder.punct(train.src_punct)
@@ -144,8 +138,7 @@ def train(opt):
     check_model_path()
     tally_parameters(model)
 
-    optimizer = MyAdam(model.parameters(),
-                       lr=opt.learning_rate, amsgrad=True)
+    optimizer = torch.optim.Adam(model.parameters(), lr=opt.learning_rate)
     scheduler = ReduceLROnPlateau(optimizer, 'min',
                                   factor=opt.learning_rate_decay,
                                   patience=0)
@@ -170,9 +163,9 @@ def train(opt):
                 loss, stats = closs.compute_loss(**shard)
                 loss.div(batch_size).backward()
                 batch_stats.update(stats)
-                tot_loss += loss.data[0]
-            torch.nn.utils.clip_grad_norm(model.parameters(),
-                                          opt.max_grad_norm)
+                tot_loss += loss.item()
+            torch.nn.utils.clip_grad_norm_(model.parameters(),
+                                           opt.max_grad_norm)
             optimizer.step()
             total_stats.update(batch_stats)
             report_stats.update(batch_stats)
@@ -187,7 +180,8 @@ def train(opt):
                 # maybe adjust learning rate
                 scheduler.step(valid_stats.ppl())
                 cur_lr = optimizer.param_groups[0]['lr']
-                print('Validation perplexity %d: %g' % (uidx, valid_stats.ppl()))
+                print('Validation perplexity %d: %g' %
+                      (uidx, valid_stats.ppl()))
                 print('Learning rate: %g' % cur_lr)
                 if cur_lr < min_lr:
                     print('Reaching minimum learning rate. Stop training!')
